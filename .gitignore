@@ -1,0 +1,32 @@
+# --- Environment / secrets ---
+.env
+*.env
+!.env.example
+!*.env.example
+
+# --- Python (server) ---
+server/venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+server/logs/
+*.log
+
+# --- Node (client) ---
+client/node_modules/
+node_modules/
+client/dist/
+client/dist-ssr/
+*.local
+
+# --- Editor / OS ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
