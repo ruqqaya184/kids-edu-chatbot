@@ -119,3 +119,20 @@ def generate_reply_stream(messages: list, temperature: float = 0.8, max_tokens: 
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def generate_reply_once(messages: list, temperature: float = 0.0, max_tokens: int = 150) -> str:
+    """
+    Non-streaming, single-shot completion -- used for the hidden state-
+    extraction call (see prompts.py's STATE_EXTRACTION_PROMPT), not shown
+    to the user. temperature=0.0 since we want consistent, literal
+    extraction here, not creative variation.
+    """
+    client, model, _ = get_client_and_model()
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content or ""

@@ -4,8 +4,15 @@ main.py
 
 The FastAPI application: home-screen activity selection, independent
 in-memory sessions with a 60-second inactivity timeout, streaming chat
-per activity, and per-request monitoring -- all six functional
-requirements wired together here.
+per activity, and per-request monitoring.
+
+UPDATED: riddles/trivia questions are now invented by the LLM itself,
+and the LLM grades the child's answers itself -- nothing is pulled from
+a static content bank anymore. A lightweight "session state" (current
+riddle/question text + topics already used) is tracked server-side and
+re-injected into the system prompt every turn, so the LLM has reliable
+memory of its own prior content even though raw conversation history is
+capped at 6 messages. See app/prompts.py for the full explanation.
 
 Run:
     export GEMINI_API_KEY="..."   (or OPENAI_API_KEY)
@@ -17,6 +24,7 @@ Then open http://127.0.0.1:8000/docs for the interactive Swagger UI.
 import asyncio
 import json
 import os
+import re
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,11 +36,8 @@ from app.session_store import (
     active_session_count, append_message, create_session, get_session,
     is_expired, session_exists, sweep_expired_sessions, terminate_session, touch,
 )
-from app.content_bank import (
-    RIDDLES, QUICK_FIRE_QUESTIONS, is_answer_correct, pick_unused_riddle, pick_unused_question,
-)
-from app.prompts import ACTIVITY_PROMPTS
-from app.llm_client import generate_reply_stream
+from app.prompts import ACTIVITY_PROMPTS, STATE_EXTRACTION_PROMPT
+from app.llm_client import generate_reply_stream, generate_reply_once
 from app.monitoring import log_llm_request
 
 app = FastAPI(
@@ -50,18 +55,10 @@ app.add_middleware(
 )
 
 
-# --------------------------------------------------------------------------- #
-# Background sweep: server-side enforcement of the 60-second session timeout,
-# independent of whether the frontend behaves well (Requirement 2's "no
-# session data shall persist after termination" is enforced HERE, not just
-# trusted to the client).
-# --------------------------------------------------------------------------- #
-
 @app.on_event("startup")
 async def start_session_sweeper():
     """Launches a background task that removes expired sessions every 10 seconds for as long as the server runs."""
     async def sweep_loop():
-        """Repeatedly removes expired sessions on a fixed interval, forever, for as long as the server runs."""
         interval = int(os.environ.get("SESSION_SWEEP_INTERVAL_SECONDS", "10"))
         while True:
             await asyncio.sleep(interval)
@@ -70,13 +67,8 @@ async def start_session_sweeper():
     asyncio.create_task(sweep_loop())
 
 
-# --------------------------------------------------------------------------- #
-# Structured error handling (same pattern established since Day 11)
-# --------------------------------------------------------------------------- #
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Converts any raised HTTPException into a structured ErrorResponse JSON body."""
     error_names = {400: "bad_request", 404: "not_found", 410: "session_expired", 500: "internal_server_error"}
     return JSONResponse(
         status_code=exc.status_code,
@@ -86,144 +78,89 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Catches any exception not already handled and converts it into a structured 500 response."""
     return JSONResponse(
         status_code=500,
         content=ErrorResponse(error="internal_server_error", detail=f"An unexpected error occurred: {exc}").model_dump(),
     )
 
 
-# --------------------------------------------------------------------------- #
-# POST /api/session/start
-# --------------------------------------------------------------------------- #
-
 @app.post("/api/session/start", response_model=StartSessionResponse, summary="Start a new, independent session for one activity")
 def start_session(request: StartSessionRequest):
-    """Requirement 2: creates a fresh, independent in-memory session for exactly one activity."""
     session_id = create_session(request.activity)
     return StartSessionResponse(session_id=session_id, activity=request.activity)
 
 
-# --------------------------------------------------------------------------- #
-# DELETE /api/session/{session_id}
-# --------------------------------------------------------------------------- #
-
 @app.delete("/api/session/{session_id}", summary="Immediately terminate a session and clear all its data")
 def end_session(session_id: str):
-    """Called when the user clicks Back, or by the frontend's own 60-second inactivity timer. Requirement 2: no session data shall persist after termination."""
     terminate_session(session_id)
     return {"status": "terminated"}
 
 
 # --------------------------------------------------------------------------- #
-# The activity state machine: builds the next synthetic instruction message
-# for the LLM based on the session's current game state and the action the
-# user just took. Content selection and correctness grading are
-# deterministic (content_bank.py); only the DELIVERY text is generated by
-# the LLM, guided by this instruction.
+# Session game-state helpers (replaces the old content_bank-driven state
+# machine). Stored directly on the session dict, lazily initialized.
 # --------------------------------------------------------------------------- #
 
-def _advance_brain_buster(session: dict, action: str, message: str) -> str:
-    """Returns the synthetic instruction text for the LLM's next turn, and mutates session state (current riddle, hints, used set) accordingly."""
-    if session["current_index"] is None:
-        idx, riddle = pick_unused_riddle(session["used_riddle_indices"])
-        if riddle is None:
-            return "The riddle bank is empty. Warmly tell the child there are no more riddles right now and congratulate them on playing."
-        session["used_riddle_indices"].add(idx)
-        session["current_index"] = idx
-        session["hints_given"] = 0
-        return f'Present this NEW riddle to the child: "{riddle["riddle"]}". Do not reveal the answer.'
+MAX_TRACKED_TOPICS = 15  # avoid an unbounded list over a very long session
 
-    riddle = RIDDLES[session["current_index"]]
 
-    if action == "hint":
-        if session["hints_given"] >= 3:
-            action = "giveup"  # all hints already used -> treat like a give-up (reveal + move on)
-        else:
-            session["hints_given"] += 1
-            hint_text = riddle["hints"][session["hints_given"] - 1]
-            if session["hints_given"] == 3:
-                # Per the spec, the answer is revealed after the 3rd hint.
-                next_idx, next_riddle = pick_unused_riddle(session["used_riddle_indices"])
-                if next_riddle is None:
-                    session["current_index"] = None
-                    return (f'Give the child this final hint: "{hint_text}". Then reveal that the answer was '
-                            f'"{riddle["answers"][0]}", said warmly. Then let them know there are no more riddles '
-                            f'right now and congratulate them on playing.')
-                session["used_riddle_indices"].add(next_idx)
-                session["current_index"] = next_idx
-                session["hints_given"] = 0
-                return (f'Give the child this final hint: "{hint_text}". Then reveal that the answer was '
-                        f'"{riddle["answers"][0]}", said warmly with no negative tone. Then present this NEW riddle: '
-                        f'"{next_riddle["riddle"]}". Do not reveal its answer.')
-            return f'Give the child this hint (hint #{session["hints_given"]} of 3): "{hint_text}"'
+def _get_game_state(session: dict) -> dict:
+    """Lazily initializes and returns this session's game_state dict."""
+    return session.setdefault("game_state", {"active_prompt": None, "topics_used": []})
 
-    if action == "giveup":
-        answer = riddle["answers"][0]
-        next_idx, next_riddle = pick_unused_riddle(session["used_riddle_indices"])
-        if next_riddle is None:
-            session["current_index"] = None
-            return (f'The child gave up. Kindly reveal that the answer was "{answer}", with no negative tone. '
-                     'Then let them know there are no more riddles right now and congratulate them on playing.')
-        session["used_riddle_indices"].add(next_idx)
-        session["current_index"] = next_idx
-        session["hints_given"] = 0
-        return (f'The child gave up. Kindly reveal that the answer was "{answer}", with no negative tone. '
-                f'Then present this NEW riddle: "{next_riddle["riddle"]}". Do not reveal its answer.')
 
-    # action == "answer"
-    if is_answer_correct(message or "", riddle["answers"]):
-        next_idx, next_riddle = pick_unused_riddle(session["used_riddle_indices"])
-        if next_riddle is None:
-            session["current_index"] = None
-            return ('The child answered CORRECTLY! Celebrate warmly and enthusiastically. Then let them know '
-                     "there are no more riddles right now and congratulate them on completing Brain Buster.")
-        session["used_riddle_indices"].add(next_idx)
-        session["current_index"] = next_idx
-        session["hints_given"] = 0
-        return (f'The child answered CORRECTLY! Celebrate warmly and enthusiastically (vary your praise). '
-                f'Then present this NEW riddle: "{next_riddle["riddle"]}". Do not reveal its answer.')
+def _build_state_context(activity: str, game_state: dict) -> str:
+    """
+    Builds the 'Current session state' note re-injected into the system
+    prompt every turn, giving the LLM reliable memory of its own current
+    riddle/question and recently used topics -- independent of whether
+    raw conversation history has scrolled past the 6-message cap.
+    """
+    if activity == "ask_explore":
+        return ""  # no game state for open-ended chat
+
+    active = game_state.get("active_prompt")
+    topics = game_state.get("topics_used", [])
+
+    lines = ["Current session state:"]
+    if active:
+        lines.append(f'- The riddle/question currently awaiting an answer is: "{active}"')
     else:
-        return (f'The child answered INCORRECTLY (they said: "{message}"). Do NOT reveal the answer. '
-                 "Respond with warm, gentle encouragement and invite them to try again or ask for a hint.")
+        lines.append("- There is no riddle/question currently active. Present a new one.")
+    if topics:
+        lines.append(f"- Topics already used this session (avoid repeating): {', '.join(topics)}")
+
+    return "\n".join(lines)
 
 
-def _advance_quick_fire(session: dict, action: str, message: str) -> str:
-    """Same pattern as Brain Buster, but for Quick Fire trivia -- no hints, and a short educational fact follows a correct answer."""
-    if session["current_index"] is None:
-        idx, q = pick_unused_question(session["used_question_indices"])
-        if q is None:
-            return "The question bank is empty. Warmly tell the child there are no more questions right now and congratulate them on playing."
-        session["used_question_indices"].add(idx)
-        session["current_index"] = idx
-        return f'Present this NEW trivia question to the child (topic: {q["topic"]}): "{q["question"]}"'
-
-    q = QUICK_FIRE_QUESTIONS[session["current_index"]]
-
-    if is_answer_correct(message or "", q["answers"]):
-        next_idx, next_q = pick_unused_question(session["used_question_indices"])
-        if next_q is None:
-            session["current_index"] = None
-            return (f'The child answered CORRECTLY! Praise them enthusiastically, then share this fun fact: '
-                    f'"{q["fact"]}". Then let them know there are no more questions right now and congratulate '
-                    "them on completing Quick Fire.")
-        session["used_question_indices"].add(next_idx)
-        session["current_index"] = next_idx
-        return (f'The child answered CORRECTLY! Praise them enthusiastically (vary your praise), then share this '
-                f'fun fact: "{q["fact"]}". Then present this NEW trivia question (topic: {next_q["topic"]}): '
-                f'"{next_q["question"]}"')
-    else:
-        next_idx, next_q = pick_unused_question(session["used_question_indices"])
-        if next_q is None:
-            session["current_index"] = None
-            return (f'The child answered INCORRECTLY. Kindly reveal the correct answer: '
-                    f'"{q["correct_answer_display"]}", with warm encouragement. Then let them know there are no '
-                    "more questions right now and congratulate them on playing.")
-        session["used_question_indices"].add(next_idx)
-        session["current_index"] = next_idx
-        return (f'The child answered INCORRECTLY (they said: "{message}"). Kindly reveal the correct answer: '
-                f'"{q["correct_answer_display"]}", with warm encouragement (never make them feel bad). Then '
-                f'present this NEW trivia question (topic: {next_q["topic"]}): "{next_q["question"]}"')
+def _extract_state(assistant_reply: str) -> dict:
+    """
+    Hidden, non-streamed follow-up call: asks the LLM to summarize its own
+    just-given reply into structured state (current active riddle/question
+    text + topic label), so we can store and re-inject it next turn. This
+    runs AFTER the visible streamed reply has already fully reached the
+    browser -- it never blocks or delays what the child sees. Falls back
+    to a safe empty state if the model's output isn't valid JSON -- this
+    must never crash the main chat flow.
+    """
+    try:
+        raw = generate_reply_once([
+            {"role": "system", "content": STATE_EXTRACTION_PROMPT},
+            {"role": "user", "content": assistant_reply},
+        ])
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return {"active_prompt": None, "topic": None}
+        parsed = json.loads(match.group(0))
+        return {
+            "active_prompt": parsed.get("active_prompt"),
+            "topic": parsed.get("topic"),
+        }
+    except Exception:
+        # State extraction is a best-effort memory aid, not a critical
+        # path -- if it fails for any reason, the game continues with no
+        # remembered state rather than crashing the request.
+        return {"active_prompt": None, "topic": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -231,14 +168,29 @@ def _advance_quick_fire(session: dict, action: str, message: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def _sse_event(data: dict) -> str:
-    """Formats one dict as a single Server-Sent Events frame."""
     return f"data: {json.dumps(data)}\n\n"
 
 
-def _stream_activity_response(session_id: str, activity: str, instruction_text: str, start_time: float, user_prompt_for_log: str):
-    """Streams the LLM's reply for one turn as SSE, then logs monitoring data (Requirement 8) once the stream completes."""
+def _stream_activity_response(session_id: str, activity: str, start_time: float, user_message_for_log: str):
+    """
+    Streams the LLM's reply as SSE -- THIS STREAMING LOOP IS UNCHANGED FROM
+    BEFORE. The LLM invents/grades content itself, guided only by the
+    system prompt + freshly-built state context -- no synthetic 'the child
+    answered correctly' instruction is injected anymore. After the visible
+    reply has fully streamed to the browser, a hidden non-streamed
+    follow-up call extracts updated state (see _extract_state) before
+    logging -- this happens after streaming is already complete, so it
+    never affects the streamed response itself.
+    """
+    session = get_session(session_id)
+    game_state = _get_game_state(session)
+
     system_prompt = ACTIVITY_PROMPTS[activity]
-    history = get_session(session_id)["messages"]
+    state_context = _build_state_context(activity, game_state)
+    if state_context:
+        system_prompt = f"{system_prompt}\n\n{state_context}"
+
+    history = session["messages"]
     messages = [{"role": "system", "content": system_prompt}] + history
 
     full_text = ""
@@ -264,9 +216,20 @@ def _stream_activity_response(session_id: str, activity: str, instruction_text: 
     if session_exists(session_id):
         append_message(session_id, "assistant", full_text)
 
+        # Hidden follow-up call: update this session's remembered state.
+        # Runs after streaming is fully done -- does not affect the
+        # response the child already received.
+        if activity != "ask_explore":
+            extracted = _extract_state(full_text)
+            game_state["active_prompt"] = extracted.get("active_prompt")
+            topic = extracted.get("topic")
+            if topic and topic not in game_state["topics_used"]:
+                game_state["topics_used"].append(topic)
+                game_state["topics_used"] = game_state["topics_used"][-MAX_TRACKED_TOPICS:]
+
     total_ms = (time.perf_counter() - start_time) * 1000
     log_llm_request(
-        session_id=session_id, activity=activity, user_prompt=user_prompt_for_log, model=model_used,
+        session_id=session_id, activity=activity, user_prompt=user_message_for_log, model=model_used,
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens,
         ttft_ms=ttft_ms, total_ms=total_ms,
     )
@@ -276,7 +239,14 @@ def _stream_activity_response(session_id: str, activity: str, instruction_text: 
 
 @app.post("/api/chat/stream", summary="Send a message/action and stream the activity's reply token-by-token")
 def chat_stream(request: ChatRequest):
-    """Validates the request, advances the relevant activity's state machine, and streams the LLM's reply back as SSE."""
+    """
+    Validates the request and streams the LLM's reply back as SSE. The
+    child's message (whatever they typed, or whatever a UI button sent as
+    plain text, e.g. "Can I get a hint?") is forwarded to the LLM as-is --
+    there is no more special-cased action branching for hint/giveup/answer.
+    The LLM itself decides what kind of message it received and how to
+    respond, guided by the system prompt.
+    """
     start_time = time.perf_counter()
 
     if not session_exists(request.session_id):
@@ -285,32 +255,26 @@ def chat_stream(request: ChatRequest):
         terminate_session(request.session_id)
         raise HTTPException(status_code=410, detail="Session expired after 60 seconds of inactivity. Please start a new session.")
 
-    if request.action == "answer" and not (request.message or "").strip():
-        raise HTTPException(status_code=400, detail="'message' must not be empty for action='answer'.")
-
     touch(request.session_id)
     session = get_session(request.session_id)
     activity = session["activity"]
 
-    if request.message:
-        append_message(request.session_id, "user", request.message)
+    user_message = (request.message or "").strip()
 
-    if activity == "brain_buster":
-        instruction = _advance_brain_buster(session, request.action, request.message or "")
-    elif activity == "quick_fire":
-        instruction = _advance_quick_fire(session, request.action, request.message or "")
-    else:  # ask_explore -- pure open-ended chat, no game state machine
-        instruction = request.message or "Greet the child warmly and ask what they're curious about today."
-
-    append_message(request.session_id, "user", instruction)
+    if user_message:
+        append_message(request.session_id, "user", user_message)
+    elif not session["messages"]:
+        # First turn of the session with no message yet (e.g. frontend
+        # just opened the activity) -- nudge the LLM to open with a
+        # greeting + first riddle/question, per each prompt's instructions.
+        append_message(request.session_id, "user", "(The child just opened this activity. Greet them and begin.)")
 
     return StreamingResponse(
-        _stream_activity_response(request.session_id, activity, instruction, start_time, request.message or instruction),
+        _stream_activity_response(request.session_id, activity, start_time, user_message),
         media_type="text/event-stream",
     )
 
 
 @app.get("/", summary="Health check")
 def root():
-    """Health check, also reporting the current number of active sessions."""
     return {"status": "ok", "active_sessions": active_session_count()}

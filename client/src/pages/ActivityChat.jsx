@@ -37,11 +37,11 @@ function ActivityChat({ activity, onBack }) {
     });
   }
 
-  async function runTurn(action, message) {
+    async function runTurn(message) {
     setIsSending(true);
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
     try {
-      await streamActivityTurn(sessionId, action, message, (deltaText) => {
+      await streamActivityTurn(sessionId, message, (deltaText) => {
         updateLastMessage((m) => ({ ...m, content: m.content + deltaText }));
       });
     } catch (err) {
@@ -85,8 +85,8 @@ function ActivityChat({ activity, onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activity]);
 
-  useEffect(() => {
-    if (sessionId) runTurn("start", null);
+    useEffect(() => {
+    if (sessionId) runTurn(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
@@ -94,24 +94,24 @@ function ActivityChat({ activity, onBack }) {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, isSending]);
 
-  function handleSend(text) {
+   function handleSend(text) {
     resetActivity();
     setMessages((prev) => [...prev, { role: "user", content: text }]);
-    runTurn("answer", text);
+    runTurn(text);
   }
-
-  function handleHint() {
+    function handleHint() {
     resetActivity();
-    setMessages((prev) => [...prev, { role: "user", content: "💡 (asked for a hint)" }]);
-    runTurn("hint", null);
+    const text = "Can I get a hint?";
+    setMessages((prev) => [...prev, { role: "user", content: "💡 " + text }]);
+    runTurn(text);
   }
 
   function handleGiveUp() {
     resetActivity();
-    setMessages((prev) => [...prev, { role: "user", content: "🏳️ (gave up)" }]);
-    runTurn("giveup", null);
+    const text = "I give up, what's the answer?";
+    setMessages((prev) => [...prev, { role: "user", content: "🏳️ " + text }]);
+    runTurn(text);
   }
-
   function handleBackClick() {
     if (sessionIdRef.current) endSession(sessionIdRef.current);
     onBack();

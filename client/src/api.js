@@ -52,16 +52,20 @@ export async function endSession(sessionId) {
 }
 
 /**
- * Streams one activity turn. action is "answer" (with message text),
- * "hint", or "giveup". Calls onDelta(text) per chunk as it streams in.
+ * Streams one activity turn. message is whatever plain-text message the
+ * child is sending this turn -- typed input, or the text a UI button
+ * (Hint / Give Up) sends on the child's behalf (e.g. "Can I get a
+ * hint?"). There is no more "action" concept: the LLM itself determines
+ * what kind of message it received, guided by the system prompt.
+ * Calls onDelta(text) per chunk as it streams in.
  */
-export async function streamActivityTurn(sessionId, action, message, onDelta) {
+export async function streamActivityTurn(sessionId, message, onDelta) {
   let response;
   try {
     response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, action, message }),
+      body: JSON.stringify({ session_id: sessionId, message }),
     });
   } catch (networkError) {
     throw new Error(`Could not reach the server at ${API_BASE_URL}. Is the backend running? (${networkError.message})`);
