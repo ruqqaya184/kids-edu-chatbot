@@ -85,8 +85,12 @@ function ActivityChat({ activity, onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activity]);
 
-    useEffect(() => {
-    if (sessionId) runTurn(null);
+     const hasSentFirstTurn = useRef(false);
+  useEffect(() => {
+    if (!sessionId) return;
+    if (hasSentFirstTurn.current) return;
+    hasSentFirstTurn.current = true;
+    runTurn(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
