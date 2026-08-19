@@ -106,15 +106,16 @@ MAX_TRACKED_TOPICS = 15  # avoid an unbounded list over a very long session
 
 def _get_game_state(session: dict) -> dict:
     """Lazily initializes and returns this session's game_state dict."""
-    return session.setdefault("game_state", {"active_prompt": None, "topics_used": []})
-
+    return session.setdefault("game_state", {"active_prompt": None, "topics_used": [], "hints_given": 0})
 
 def _build_state_context(activity: str, game_state: dict) -> str:
     """
     Builds the 'Current session state' note re-injected into the system
     prompt every turn, giving the LLM reliable memory of its own current
-    riddle/question and recently used topics -- independent of whether
-    raw conversation history has scrolled past the 6-message cap.
+    riddle/question, recently used topics, and (for Brain Buster) how many
+    hints have already been given for the current riddle -- independent
+    of whether raw conversation history has scrolled past the 6-message
+    cap.
     """
     if activity == "ask_explore":
         return ""  # no game state for open-ended chat
@@ -130,6 +131,10 @@ def _build_state_context(activity: str, game_state: dict) -> str:
     if topics:
         lines.append(f"- Topics already used this session (avoid repeating): {', '.join(topics)}")
 
+    if activity == "brain_buster" and active:
+        hints_given = game_state.get("hints_given", 0)
+        lines.append(f"- Hints given so far for the current riddle: {hints_given} (maximum allowed is 3)")
+
     return "\n".join(lines)
 
 
@@ -137,11 +142,11 @@ def _extract_state(assistant_reply: str) -> dict:
     """
     Hidden, non-streamed follow-up call: asks the LLM to summarize its own
     just-given reply into structured state (current active riddle/question
-    text + topic label), so we can store and re-inject it next turn. This
-    runs AFTER the visible streamed reply has already fully reached the
-    browser -- it never blocks or delays what the child sees. Falls back
-    to a safe empty state if the model's output isn't valid JSON -- this
-    must never crash the main chat flow.
+    text, topic label, and whether a hint was just given), so we can store
+    and re-inject it next turn. This runs AFTER the visible streamed reply
+    has already fully reached the browser -- it never blocks or delays
+    what the child sees. Falls back to a safe empty state if the model's
+    output isn't valid JSON -- this must never crash the main chat flow.
     """
     try:
         raw = generate_reply_once([
@@ -150,17 +155,18 @@ def _extract_state(assistant_reply: str) -> dict:
         ])
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            return {"active_prompt": None, "topic": None}
+            return {"active_prompt": None, "topic": None, "hint_given": False}
         parsed = json.loads(match.group(0))
         return {
             "active_prompt": parsed.get("active_prompt"),
             "topic": parsed.get("topic"),
+            "hint_given": bool(parsed.get("hint_given", False)),
         }
     except Exception:
         # State extraction is a best-effort memory aid, not a critical
         # path -- if it fails for any reason, the game continues with no
         # remembered state rather than crashing the request.
-        return {"active_prompt": None, "topic": None}
+        return {"active_prompt": None, "topic": None, "hint_given": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -219,13 +225,27 @@ def _stream_activity_response(session_id: str, activity: str, start_time: float,
         # Hidden follow-up call: update this session's remembered state.
         # Runs after streaming is fully done -- does not affect the
         # response the child already received.
+               # Hidden follow-up call: update this session's remembered state.
+        # Runs after streaming is fully done -- does not affect the
+        # response the child already received.
         if activity != "ask_explore":
+            previous_active_prompt = game_state.get("active_prompt")
             extracted = _extract_state(full_text)
-            game_state["active_prompt"] = extracted.get("active_prompt")
+            new_active_prompt = extracted.get("active_prompt")
+
+            game_state["active_prompt"] = new_active_prompt
             topic = extracted.get("topic")
             if topic and topic not in game_state["topics_used"]:
                 game_state["topics_used"].append(topic)
                 game_state["topics_used"] = game_state["topics_used"][-MAX_TRACKED_TOPICS:]
+
+            if activity == "brain_buster":
+                if new_active_prompt != previous_active_prompt:
+                    # A new riddle started (or the old one was resolved) --
+                    # reset the hint counter for the fresh riddle.
+                    game_state["hints_given"] = 0
+                elif extracted.get("hint_given"):
+                    game_state["hints_given"] = game_state.get("hints_given", 0) + 1
 
     total_ms = (time.perf_counter() - start_time) * 1000
     log_llm_request(

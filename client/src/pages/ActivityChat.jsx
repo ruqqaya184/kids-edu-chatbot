@@ -36,10 +36,40 @@ function ActivityChat({ activity, onBack }) {
       return copy;
     });
   }
+      // Mirrors the backend's session_store.py: 6 EXCHANGES kept, where one
+  // exchange = one user message + the one assistant reply after it.
+  const MAX_VISIBLE_EXCHANGES = 6;
+  const MAX_VISIBLE_MESSAGES = MAX_VISIBLE_EXCHANGES * 2;
 
-    async function runTurn(message) {
+    function appendMessage(newMessage, { pinned = false } = {}) {
+    setMessages((prev) => {
+      const next = [...prev, { ...newMessage, _pinned: pinned }];
+      const pinnedCount = next.filter((m) => m._pinned).length;
+      const trimmableCount = next.length - pinnedCount;
+      if (trimmableCount > MAX_VISIBLE_MESSAGES) {
+        // Only trim from the oldest UNPINNED messages, in order, so the
+        // opening greeting (which has no matching user message before
+        // it) never gets counted as "half an exchange" -- only real
+        // (user, assistant) pairs are capped at MAX_VISIBLE_EXCHANGES.
+        let toRemove = trimmableCount - MAX_VISIBLE_MESSAGES;
+        const result = [];
+        for (const m of next) {
+          if (!m._pinned && toRemove > 0) {
+            toRemove -= 1;
+            continue;
+          }
+          result.push(m);
+        }
+        return result;
+      }
+      return next;
+    });
+  }
+  
+
+      async function runTurn(message, { isFirstTurn = false } = {}) {
     setIsSending(true);
-    setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+    appendMessage({ role: "assistant", content: "" }, { pinned: isFirstTurn });
     try {
       await streamActivityTurn(sessionId, message, (deltaText) => {
         updateLastMessage((m) => ({ ...m, content: m.content + deltaText }));
@@ -85,12 +115,12 @@ function ActivityChat({ activity, onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activity]);
 
-     const hasSentFirstTurn = useRef(false);
+         const hasSentFirstTurn = useRef(false);
   useEffect(() => {
     if (!sessionId) return;
     if (hasSentFirstTurn.current) return;
     hasSentFirstTurn.current = true;
-    runTurn(null);
+    runTurn(null, { isFirstTurn: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
@@ -100,20 +130,20 @@ function ActivityChat({ activity, onBack }) {
 
    function handleSend(text) {
     resetActivity();
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+        appendMessage({ role: "user", content: text });
     runTurn(text);
   }
     function handleHint() {
     resetActivity();
     const text = "Can I get a hint?";
-    setMessages((prev) => [...prev, { role: "user", content: "💡 " + text }]);
+        appendMessage({ role: "user", content: "💡 " + text });
     runTurn(text);
   }
 
   function handleGiveUp() {
     resetActivity();
     const text = "I give up, what's the answer?";
-    setMessages((prev) => [...prev, { role: "user", content: "🏳️ " + text }]);
+        appendMessage({ role: "user", content: "🏳️ " + text });
     runTurn(text);
   }
   function handleBackClick() {
@@ -167,5 +197,4 @@ function ActivityChat({ activity, onBack }) {
     </div>
   );
 }
-
 export default ActivityChat;

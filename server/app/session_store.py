@@ -40,7 +40,15 @@ SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT_SECONDS", "60"))
 # }
 sessions: dict = {}
 
-MAX_CONTEXT_MESSAGES = 6  # Requirement 7: only the 6 most recent messages are kept
+# Requirement 7 (redefined): the 6 most recent EXCHANGES are kept, where
+# one exchange = one user message + the one assistant reply that follows
+# it = 2 messages. So the actual message cap is 6 * 2 = 12. Trimming
+# always removes from the oldest end, so exchanges are never split --
+# see append_message()'s comment for why the trim is safe to run on
+# every single append despite exchanges being added as two separate
+# calls (user message, then later the assistant reply).
+MAX_EXCHANGES = 6
+MAX_CONTEXT_MESSAGES = MAX_EXCHANGES * 2
 
 
 def create_session(activity: str) -> str:
@@ -97,11 +105,15 @@ def get_session(session_id: str) -> dict:
 
 
 def append_message(session_id: str, role: str, content: str) -> None:
-    """Appends a message and trims to the MAX_CONTEXT_MESSAGES most recent (Requirement 7)."""
+    """
+    Appends a message and trims to the MAX_CONTEXT_MESSAGES (= 6 exchanges
+    x 2) most recent (Requirement 7).
+    """
     messages = sessions[session_id]["messages"]
     messages.append({"role": role, "content": content})
     if len(messages) > MAX_CONTEXT_MESSAGES:
         del messages[: len(messages) - MAX_CONTEXT_MESSAGES]
+    print(f"[DEBUG append_message] role={role!r} content={content[:40]!r} -> now {len(messages)} messages: {[m['role'] for m in messages]}")
 
 
 def active_session_count() -> int:
